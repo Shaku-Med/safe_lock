@@ -1,0 +1,6 @@
+cryptography>=42.0.0
+argon2-cffi>=23.1.0
+tqdm>=4.66.0
+Pillow>=10.0.0
+stegano>=0.11.1
+
