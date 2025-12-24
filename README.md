@@ -44,7 +44,7 @@ Start the program by running:
 python main.py
 ```
 
-You'll see a menu with options to encrypt or decrypt files.
+You'll see a menu with options to encrypt or decrypt files, including options for single files or entire directories.
 
 ## How to Encrypt a File
 
@@ -64,9 +64,11 @@ When you choose to encrypt a file, the program will guide you through these step
    
    - You'll also need to create a password for the key file itself. This is the only password you'll need to remember if you save your keys. The key file is encrypted, so even if someone finds it, they can't use it without your password.
 
-5. **Wait for encryption**: The program will show you progress as it encrypts your file. This might take a moment for large files.
+5. **Choose where to save**: You'll be asked where you want to save the encrypted file. You can press Enter to use the default output folder, or enter a custom path to save it anywhere you prefer.
 
-Your encrypted file will be saved in the output folder with the same name and extension as the original. The original file remains unchanged.
+6. **Wait for encryption**: The program will show you progress as it encrypts your file. This might take a moment for large files.
+
+Your encrypted file will be saved in your chosen location with the same name and extension as the original. The original file remains unchanged.
 
 ## How to Decrypt a File
 
@@ -78,7 +80,43 @@ To get your file back, you'll need to decrypt it:
    - If you saved your keys earlier, you can load them from the file or image. You'll just need to enter the password you used to protect the key file.
    - If you didn't save your keys, you'll need to enter each key manually, just like when you encrypted the file.
 
-3. **Wait for decryption**: The program will decrypt your file and save it in the output folder.
+3. **Choose where to save**: You'll be asked where you want to save the decrypted file. You can press Enter to use the default output folder, or enter a custom path.
+
+4. **Wait for decryption**: The program will decrypt your file and save it in your chosen location.
+
+## Encrypting Multiple Files at Once
+
+If you have a folder full of files you want to encrypt, you don't need to do them one by one. The tool includes a directory encryption feature that makes this much easier.
+
+When you choose the directory encryption option from the main menu:
+
+1. **Select your folder**: Enter the path to the directory containing all the files you want to encrypt. The program will show you a list of all files it found in that folder.
+
+2. **Enter your keys once**: You'll be asked to enter your encryption keys just once. These same keys will be used to encrypt every file in the directory, which saves you a lot of time.
+
+3. **Choose where to save**: Pick where you want all the encrypted files to be saved. You can use the default output folder or choose your own location.
+
+4. **Watch the progress**: The program will encrypt each file one by one, showing you which file it's working on and how many are left. You'll see a summary at the end showing how many files were successfully encrypted.
+
+5. **Save your keys**: After all files are encrypted, you'll be asked if you want to save your keys to a file. This is especially useful when encrypting many files, since you'll only need to remember one password to unlock all of them later.
+
+All encrypted files will be saved with their original names in your chosen output location. Each file is encrypted independently, so if one file has an issue, the others will still be fine.
+
+## Decrypting Multiple Files at Once
+
+Just like with encryption, you can decrypt an entire folder of encrypted files at once. This is perfect when you've encrypted a whole directory and want to get everything back.
+
+When you choose the directory decryption option:
+
+1. **Select your folder**: Enter the path to the directory containing all the encrypted files you want to decrypt.
+
+2. **Enter your passwords once**: The program will detect how many keys were used to encrypt the files, then ask you to provide your passwords just once. If you saved your keys to a file, you can load them from there using your key file password.
+
+3. **Choose where to save**: Pick where you want all the decrypted files to be saved.
+
+4. **Watch the progress**: The program will decrypt each file one by one, using the same passwords but with each file's unique encryption parameters. You'll see progress for each file and a summary at the end.
+
+The decryption process handles the fact that each file was encrypted with different random values, so even though you use the same passwords, each file is properly decrypted using its own specific encryption settings.
 
 ## Understanding Key Files
 
@@ -90,6 +128,8 @@ When you save your keys, they're stored in an encrypted format. This means:
 - You only need to remember one password (for the key file) instead of remembering all your encryption keys
 
 If you choose to save keys in an image, the image will look completely normal. The keys are hidden using steganography, which embeds the data in a way that's invisible to the naked eye. You can share the image, use it as a wallpaper, or store it anywhere, and it will still look like a regular picture.
+
+When you save keys to an image, the output will always be saved as a PNG file, even if your original cover image was a different format. This is necessary because PNG is a lossless format that preserves the hidden steganography data. Other formats like JPEG use compression that would destroy the hidden information. The program will automatically convert your cover image to PNG format during the process, so you can use any image you want as a starting point.
 
 ## Important Security Notes
 
@@ -129,6 +169,9 @@ Large files and more encryption keys will take longer to process. This is normal
 
 **I'm getting permission errors:**
 Make sure you have write permissions in the output folder and wherever you're trying to save key files. On Windows, you might need to run the program as administrator if you're saving to certain locations.
+
+**I can't load keys from my image file:**
+If you're having trouble loading keys from an image, make sure you're using the exact PNG file that was created when you saved your keys. Image key files must be in PNG format to preserve the hidden data. If the image was edited, compressed, converted to another format, or resaved after the keys were hidden, the hidden data may have been destroyed. In this case, you'll need to use your original encryption keys manually, or if you have a JSON key file, use that instead. JSON key files are more reliable since they don't depend on image formats.
 
 ## Upcoming Features
 
