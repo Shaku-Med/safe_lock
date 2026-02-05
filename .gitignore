@@ -18,4 +18,5 @@ input/*
 !input/.gitkeep
 cover_images/*
 !cover_images/.gitkeep
+steal_locker/key.private
 

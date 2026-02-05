@@ -1,4 +1,4 @@
-# Quantum-Safe Multi-Layer Encryption Tool
+# Fuck BitLocker – Quantum-Safe Multi-Layer Encryption Tool
 
 A secure encryption tool that lets you encrypt your sensitive files with multiple layers of protection. You can use anywhere from 2 to 50 different encryption keys, and all your keys can be saved securely so you don't have to remember them all.
 
@@ -131,6 +131,36 @@ If you choose to save keys in an image, the image will look completely normal. T
 
 When you save keys to an image, the output will always be saved as a PNG file, even if your original cover image was a different format. This is necessary because PNG is a lossless format that preserves the hidden steganography data. Other formats like JPEG use compression that would destroy the hidden information. The program will automatically convert your cover image to PNG format during the process, so you can use any image you want as a starting point.
 
+## Steal Locker (device-locked encryption)
+
+Steal Locker is an **extra mode** you can use from the main menu (option `5`) when you want data that is effectively *married* to one device and one user, with **no vendor recovery path**.
+
+### What Steal Locker does
+
+- Creates an **X25519 device keypair** (private + public) the first time you use it.
+  - Keys are stored in a hidden, OS-specific location by default (or a custom folder/drive you pick).
+  - You can optionally **encrypt the private key itself with a passphrase**. If you forget this passphrase, Steal Locker data is **permanently unrecoverable**.
+- Uses that device key to wrap random symmetric keys via **ECDH (X25519) + HKDF + AES‑256‑GCM**.
+- All Steal Locker decrypts are hardened against:
+  - Path traversal (sanitized filenames, no `..` or path separators).
+  - Decryption oracles (all failures return the same generic error).
+
+### Steal Locker menu options
+
+From the main menu choose `5. Steal Locker`:
+
+- **1. Lock folder**
+  - **Mode 1:** Encrypt every file in the folder using the same multi-layer scheme as option 3, then lock the key material with the device key. Output is a `.locked_dir` folder with a manifest and encrypted files.
+  - **Mode 2:** Zip the whole folder, encrypt the zip with a random key, and wrap that key with the device key. Output is a single `.locked` file.
+- **2. Unlock folder**
+  - Unlock either a `.locked_dir` (per-file mode) or a `.locked` zip into a target output folder.
+- **3. Encrypt file (device key only)**
+  - Encrypt a single file with a random symmetric key wrapped by the device key. Format uses a small `SL01` header + wrapped key + AES‑GCM ciphertext.
+- **4. Decrypt file (device key)**
+  - Decrypt a Steal Locker single-file payload. Any error (wrong key, tampering, corruption) shows one generic failure message.
+
+Steal Locker is ideal when you want **“even if someone gets my encrypted files and all my normal keys, they still can’t open this without this specific device + my passphrase”**.
+
 ## Important Security Notes
 
 - Always remember your key file password if you choose to save your keys. Without it, you won't be able to decrypt your files even if you have the key file.
@@ -172,20 +202,6 @@ Make sure you have write permissions in the output folder and wherever you're tr
 
 **I can't load keys from my image file:**
 If you're having trouble loading keys from an image, make sure you're using the exact PNG file that was created when you saved your keys. Image key files must be in PNG format to preserve the hidden data. If the image was edited, compressed, converted to another format, or resaved after the keys were hidden, the hidden data may have been destroyed. In this case, you'll need to use your original encryption keys manually, or if you have a JSON key file, use that instead. JSON key files are more reliable since they don't depend on image formats.
-
-## Upcoming Features
-
-**Same Device Decryption Only Option**
-
-We're working on adding an option that lets you restrict decryption to the device where you encrypted the file. When you choose this option during encryption, the tool will generate a private key unique to your device and incorporate it into the encryption process.
-
-This means:
-- Your encrypted file can only be decrypted on the same computer where it was encrypted
-- Even if someone has your encryption keys and the encrypted file, they won't be able to decrypt it on a different device
-- This provides an extra layer of security for files you only want accessible on one specific machine
-- You'll still be able to choose between device-locked and portable encryption when you encrypt each file
-
-This feature is useful if you want to ensure your sensitive files never leave your primary device, even if your encryption keys or key files are compromised. The device-specific key is generated from hardware and system characteristics, making it unique to your computer.
 
 ## Technical Details
 

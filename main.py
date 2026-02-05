@@ -3,6 +3,7 @@ import sys
 import getpass
 from pathlib import Path
 from tqdm import tqdm
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from src.encryption import multi_layer_encrypt, multi_layer_decrypt
 from src.key_derivation import (
     derive_key_argon2, generate_salt,
@@ -11,8 +12,16 @@ from src.key_derivation import (
 )
 from src.utils import (
     pack_metadata, unpack_metadata, get_file_info, ensure_directory,
-    get_metadata_size, KEY_TYPE_PASSWORD_ARGON2
+    get_metadata_size, KEY_TYPE_PASSWORD_ARGON2,
+    pack_steal_locker_metadata, get_steal_locker_metadata_size,
+    unpack_steal_locker_metadata, _sanitize_steal_locker_output_filename,
 )
+from steal_locker.key import (
+    ensure_keypair, load_public_key, load_private_key,
+    wrap_symmetric_key, unwrap_symmetric_key, WRAPPED_BLOB_SIZE,
+    _key_dir as _steal_key_dir,
+)
+from steal_locker import lock as steal_lock
 
 def get_key_count():
     while True:
@@ -444,10 +453,7 @@ def decrypt_file():
             return
         
         decrypted_data = multi_layer_decrypt(encrypted_data, keys)
-        
-        original_filename_str = original_filename.decode('utf-8')
-        file_extension_str = file_extension.decode('utf-8')
-        output_filename = f"{original_filename_str}{file_extension_str}"
+        output_filename = _sanitize_steal_locker_output_filename(original_filename, file_extension)
         output_path = os.path.join(output_dir, output_filename)
         
         with tqdm(total=len(decrypted_data), unit='B', unit_scale=True, unit_divisor=1024, desc="Saving decrypted file") as pbar:
@@ -458,9 +464,8 @@ def decrypt_file():
         print(f"\n✓ Decryption complete!")
         print(f"✓ Decrypted file saved to: {output_path}")
         
-    except Exception as e:
-        print(f"Error during decryption: {str(e)}")
-        print("Make sure you entered the correct keys and the file is a valid encrypted file.")
+    except Exception:
+        print("Decryption failed (wrong key, tampered data, or invalid file).")
 
 def decrypt_directory():
     print("\n=== Decrypt All Files in Directory ===\n")
@@ -539,15 +544,9 @@ def decrypt_directory():
                 pbar.update(1)
             
             key_types, salts, original_filename, file_extension = unpack_metadata(metadata)
-            
-            # Derive keys for this file using its salts and the passwords
             keys = derive_keys_from_passwords(passwords, salts)
-            
             decrypted_data = multi_layer_decrypt(encrypted_data, keys)
-            
-            original_filename_str = original_filename.decode('utf-8')
-            file_extension_str = file_extension.decode('utf-8')
-            output_filename = f"{original_filename_str}{file_extension_str}"
+            output_filename = _sanitize_steal_locker_output_filename(original_filename, file_extension)
             output_path = os.path.join(output_dir, output_filename)
             
             with tqdm(total=len(decrypted_data), unit='B', unit_scale=True, unit_divisor=1024, desc="  Saving decrypted file", leave=False) as pbar:
@@ -558,8 +557,8 @@ def decrypt_directory():
             print(f"  ✓ Decrypted: {output_path}")
             successful += 1
             
-        except Exception as e:
-            print(f"  ✗ Error decrypting {filename}: {str(e)}")
+        except Exception:
+            print(f"  ✗ Error decrypting {filename}: Decryption failed (wrong key, tampered data, or invalid file).")
             failed += 1
     
     print(f"\n{'='*60}")
@@ -660,6 +659,162 @@ def encrypt_directory():
         if save_result is None:
             print("\n⚠ Keys were not saved. Make sure to remember them!")
 
+
+def _steal_locker_key_dir() -> Path:
+    # Use the OS-specific hidden key directory chosen by steal_locker.key
+    return _steal_key_dir()
+
+
+def encrypt_file_steal_locker():
+    """Single file: encrypt with device key only (SL01 + wrapped key + AES-GCM)."""
+    print("\n=== Steal Locker: Encrypt file (device key) ===\n")
+    file_path = input("Enter path to file to encrypt: ").strip().strip('"')
+    if not os.path.exists(file_path):
+        print(f"Error: File not found: {file_path}")
+        return
+    key_dir = _steal_locker_key_dir()
+    try:
+        priv_path, pub_path = ensure_keypair(key_dir)
+        pub = load_public_key(pub_path)
+    except Exception as e:
+        print(f"Error: {e}")
+        return
+    output_dir = get_output_directory()
+    name, ext = get_file_info(file_path)
+    fn_bytes, ext_bytes = name.encode("utf-8"), ext.encode("utf-8")
+    sym_key = os.urandom(32)
+    wrapped = wrap_symmetric_key(sym_key, pub)
+    with open(file_path, "rb") as f:
+        plaintext = f.read()
+    aes = AESGCM(sym_key)
+    nonce = os.urandom(12)
+    ct = aes.encrypt(nonce, plaintext, None)
+    metadata = pack_steal_locker_metadata(WRAPPED_BLOB_SIZE, fn_bytes, ext_bytes)
+    out_path = os.path.join(output_dir, f"{name}{ext}")
+    with open(out_path, "wb") as f:
+        f.write(metadata + wrapped + nonce + ct)
+    print(f"\n✓ Encrypted to {out_path}")
+
+
+def decrypt_file_steal_locker():
+    """Decrypt a Steal Locker file; one generic error to avoid oracle leakage."""
+    print("\n=== Steal Locker: Decrypt file ===\n")
+    enc_path = input("Enter path to encrypted file: ").strip().strip('"')
+    if not os.path.exists(enc_path):
+        print(f"Error: File not found: {enc_path}")
+        return
+    output_dir = get_output_directory()
+    key_dir = _steal_locker_key_dir()
+    err_msg = "Decryption failed (wrong key, tampered data, or invalid file)"
+    try:
+        with open(enc_path, "rb") as f:
+            payload = f.read()
+        meta_size = get_steal_locker_metadata_size(payload)
+        metadata = payload[:meta_size]
+        rest = payload[meta_size:]
+        wlen, fn_bytes, ext_bytes = unpack_steal_locker_metadata(metadata)
+        if len(rest) < wlen + 12:
+            raise ValueError(err_msg)
+        wrapped = rest[:wlen]
+        if len(wrapped) != WRAPPED_BLOB_SIZE:
+            raise ValueError(err_msg)
+        priv = load_private_key(ensure_keypair(key_dir)[0])
+        sym_key = unwrap_symmetric_key(wrapped, priv)
+        nonce = rest[wlen : wlen + 12]
+        ct = rest[wlen + 12 :]
+        aes = AESGCM(sym_key)
+        plaintext = aes.decrypt(nonce, ct, None)
+        out_name = _sanitize_steal_locker_output_filename(fn_bytes, ext_bytes)
+        out_path = os.path.join(output_dir, out_name)
+        with open(out_path, "wb") as f:
+            f.write(plaintext)
+        print(f"\n✓ Decrypted to {out_path}")
+    except Exception:
+        print(err_msg)
+
+
+def steal_locker_lock_folder():
+    """Lock folder: (A) encrypt each file with option-3 then finalize, (B) zip then encrypt."""
+    print("\n=== Steal Locker: Lock folder ===\n")
+    dir_path = input("Enter path to folder to lock: ").strip().strip('"')
+    if not os.path.isdir(dir_path):
+        print("Error: Not a directory or not found.")
+        return
+    print("1. Encrypt every file (option-3 style) then finalize with device key")
+    print("2. Zip folder then encrypt with device key")
+    choice = input("Select (1 or 2): ").strip()
+    key_dir = _steal_locker_key_dir()
+    output_dir = get_output_directory()
+    if choice == "1":
+        num_keys = get_key_count()
+        key_data = collect_keys_without_saving(num_keys)
+        if key_data is None:
+            return
+        out_path = Path(output_dir) / (Path(dir_path).name + ".locked_dir")
+        try:
+            steal_lock.lock_folder_per_file(
+                Path(dir_path), key_data, key_dir, out_path,
+                progress_cb=lambda n: None,
+            )
+            print(f"\n✓ Locked folder saved to {out_path}")
+        except Exception as e:
+            print(f"Error: {e}")
+    elif choice == "2":
+        out_file = Path(output_dir) / (Path(dir_path).name + ".locked")
+        try:
+            steal_lock.lock_folder_zip(Path(dir_path), key_dir, out_file, progress_cb=lambda n: None)
+            print(f"\n✓ Locked zip saved to {out_file}")
+        except Exception as e:
+            print(f"Error: {e}")
+    else:
+        print("Invalid choice.")
+
+
+def steal_locker_unlock_folder():
+    """Unlock a Steal Locker folder (either .locked_dir or .locked zip)."""
+    print("\n=== Steal Locker: Unlock folder ===\n")
+    path = input("Enter path to .locked_dir folder or .locked file: ").strip().strip('"')
+    if not os.path.exists(path):
+        print("Error: Not found.")
+        return
+    output_dir = get_output_directory()
+    key_dir = _steal_locker_key_dir()
+    try:
+        if os.path.isfile(path) and path.endswith(".locked"):
+            steal_lock.unlock_folder_zip(Path(path), key_dir, Path(output_dir))
+            print(f"\n✓ Unzipped to {output_dir}")
+        elif os.path.isdir(path):
+            steal_lock.unlock_folder_per_file(Path(path), key_dir, Path(output_dir), progress_cb=lambda n: None)
+            print(f"\n✓ Unlocked to {output_dir}")
+        else:
+            print("Error: Provide a .locked file or a .locked_dir directory.")
+    except Exception:
+        print("Decryption failed (wrong key, tampered data, or invalid file)")
+
+
+def steal_locker_menu():
+    while True:
+        print("\n--- Steal Locker ---")
+        print("1. Lock folder (encrypt each file + device key, or zip+encrypt)")
+        print("2. Unlock folder")
+        print("3. Encrypt file (device key only)")
+        print("4. Decrypt file (device key)")
+        print("5. Back to main menu")
+        c = input("Select (1-5): ").strip()
+        if c == "1":
+            steal_locker_lock_folder()
+        elif c == "2":
+            steal_locker_unlock_folder()
+        elif c == "3":
+            encrypt_file_steal_locker()
+        elif c == "4":
+            decrypt_file_steal_locker()
+        elif c == "5":
+            return
+        else:
+            print("Invalid option.")
+
+
 def main():
     print("=" * 60)
     print("  Quantum-Safe Multi-Layer Encryption")
@@ -671,9 +826,10 @@ def main():
         print("2. Decrypt a file")
         print("3. Encrypt all files in a directory")
         print("4. Decrypt all files in a directory")
-        print("5. Exit")
+        print("5. Steal Locker (device keys, no third-party recovery)")
+        print("6. Exit")
         
-        choice = input("\nSelect an option (1-5): ").strip()
+        choice = input("\nSelect an option (1-6): ").strip()
         
         if choice == '1':
             encrypt_file()
@@ -684,10 +840,12 @@ def main():
         elif choice == '4':
             decrypt_directory()
         elif choice == '5':
+            steal_locker_menu()
+        elif choice == '6':
             print("\nGoodbye!")
             sys.exit(0)
         else:
-            print("Invalid option. Please select 1, 2, 3, 4, or 5.")
+            print("Invalid option. Please select 1-6.")
 
 if __name__ == "__main__":
     main()
