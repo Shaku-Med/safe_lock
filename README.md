@@ -1,4 +1,4 @@
-# Fuck BitLocker – Quantum-Safe Multi-Layer Encryption Tool
+# F***K BitLocker – Quantum-Safe Multi-Layer Encryption Tool
 
 A secure encryption tool that lets you encrypt your sensitive files with multiple layers of protection. You can use anywhere from 2 to 50 different encryption keys, and all your keys can be saved securely so you don't have to remember them all.
 
