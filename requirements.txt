@@ -4,3 +4,9 @@ tqdm>=4.66.0
 Pillow>=10.0.0
 stegano>=0.11.1
 
+# Optional, for OS identity verification in "Open file securely":
+#   Windows Hello:   pip install winsdk
+#   macOS Touch ID:  pip install pyobjc-framework-LocalAuthentication
+#   Linux:           uses polkit (pkexec) if present, no package needed
+# Without these, it falls back to the Steal Locker device-key passphrase.
+

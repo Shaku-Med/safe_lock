@@ -23,26 +23,31 @@ from src.key_derivation import derive_key_argon2
 
 NONCE_SIZE = 12
 KEY_SIZE = 32
-MANIFEST_VERSION = 1
+# V2 manifests store the derived keys directly (no raw passwords); V1 stored passwords + salts.
+MANIFEST_VERSION = 2
 
 
-def _encrypt_key_data(sym_key: bytes, key_data_list: list, file_list: list) -> bytes:
-    payload = json.dumps({"v": MANIFEST_VERSION, "key_data_list": key_data_list, "files": file_list}).encode("utf-8")
+def _encrypt_key_data(sym_key: bytes, keys_hex: list, file_list: list) -> bytes:
+    payload = json.dumps({"v": MANIFEST_VERSION, "keys": keys_hex, "files": file_list}).encode("utf-8")
     aes = AESGCM(sym_key)
     nonce = os.urandom(NONCE_SIZE)
     return nonce + aes.encrypt(nonce, payload, None)
 
 
-def _decrypt_key_data(sym_key: bytes, blob: bytes) -> tuple[list, list]:
+def _decrypt_key_data(sym_key: bytes, blob: bytes) -> tuple[str, list, list]:
+    """Return (kind, material, files). kind is 'keys' (V2) or 'legacy' (V1 passwords+salts)."""
     if len(blob) < NONCE_SIZE:
         raise ValueError("Decryption failed (wrong key, tampered data, or invalid file)")
     aes = AESGCM(sym_key)
     nonce, ct = blob[:NONCE_SIZE], blob[NONCE_SIZE:]
     raw = aes.decrypt(nonce, ct, None)
     data = json.loads(raw.decode("utf-8"))
-    if data.get("v") != MANIFEST_VERSION:
-        raise ValueError("Decryption failed (wrong key, tampered data, or invalid file)")
-    return data["key_data_list"], data["files"]
+    version = data.get("v")
+    if version == 2:
+        return "keys", data["keys"], data["files"]
+    if version == 1:
+        return "legacy", data["key_data_list"], data["files"]
+    raise ValueError("Decryption failed (wrong key, tampered data, or invalid file)")
 
 
 def lock_folder_per_file(
@@ -59,7 +64,6 @@ def lock_folder_per_file(
     files = [f for f in dir_path.iterdir() if f.is_file()]
     file_list = []
     keys = key_data["keys"]
-    key_data_list = key_data["key_data_list"]
 
     for f in files:
         name, ext = f.stem, f.suffix
@@ -74,7 +78,8 @@ def lock_folder_per_file(
     priv_path, pub_path = ensure_keypair(key_dir)
     pub = load_public_key(pub_path)
     wrapped = wrap_symmetric_key(sym_key, pub)
-    manifest_payload = _encrypt_key_data(sym_key, key_data_list, file_list)
+    keys_hex = [k.hex() for k in keys]
+    manifest_payload = _encrypt_key_data(sym_key, keys_hex, file_list)
     (output_dir / "manifest").write_bytes(wrapped + manifest_payload)
 
 
@@ -95,15 +100,15 @@ def unlock_folder_per_file(locked_dir: Path, key_dir: Path, output_dir: Path, pr
         priv_path, _ = ensure_keypair(key_dir)
         priv = load_private_key(priv_path)
         sym_key = unwrap_symmetric_key(wrapped, priv)
-        key_data_list, file_list = _decrypt_key_data(sym_key, payload_enc)
+        kind, material, file_list = _decrypt_key_data(sym_key, payload_enc)
     except Exception:
         raise ValueError("Decryption failed (wrong key, tampered data, or invalid file)")
 
-    keys = []
-    for item in key_data_list:
-        salt = bytes.fromhex(item["salt"])
-        key = derive_key_argon2(item["password"].encode("utf-8"), salt)
-        keys.append(key)
+    if kind == "keys":
+        keys = [bytes.fromhex(h) for h in material]
+    else:
+        # Legacy V1 manifest: re-derive from stored passwords with legacy Argon2.
+        keys = [derive_key_argon2(item["password"].encode("utf-8"), bytes.fromhex(item["salt"])) for item in material]
 
     for i, finfo in enumerate(file_list):
         enc_path = locked_dir / f"{i:06d}.enc"

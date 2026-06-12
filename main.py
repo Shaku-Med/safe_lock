@@ -6,16 +6,19 @@ from tqdm import tqdm
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from src.encryption import multi_layer_encrypt, multi_layer_decrypt
 from src.key_derivation import (
-    derive_key_argon2, generate_salt,
+    derive_key_argon2, derive_key_argon2_v2, derive_key_argon2_with_params, generate_salt,
     save_keys_file_json, load_keys_file_json,
-    save_keys_file_image, load_keys_file_image
+    save_keys_file_image, load_keys_file_image,
+    ARGON2_TIME_COST_V2, ARGON2_MEMORY_COST_V2, ARGON2_PARALLELISM_V2,
 )
+from src.file_format import is_v2, pack_header_v2, unpack_header_v2
 from src.utils import (
-    pack_metadata, unpack_metadata, get_file_info, ensure_directory,
-    get_metadata_size, KEY_TYPE_PASSWORD_ARGON2,
+    unpack_metadata, get_file_info, ensure_directory,
+    get_metadata_size, KEY_TYPE_PASSWORD_ARGON2, SL01_MAGIC,
     pack_steal_locker_metadata, get_steal_locker_metadata_size,
     unpack_steal_locker_metadata, _sanitize_steal_locker_output_filename,
 )
+from src.secure_open import verify_device_identity, view_file_temp
 from steal_locker.key import (
     ensure_keypair, load_public_key, load_private_key,
     wrap_symmetric_key, unwrap_symmetric_key, WRAPPED_BLOB_SIZE,
@@ -53,40 +56,62 @@ def collect_keys_without_saving(num_keys: int):
     keys = []
     key_types = []
     salts = []
-    key_data_list = []
-    
+
     print("\nEnter your encryption keys:")
     for i in range(num_keys):
         password = getpass.getpass(f"Enter key {i + 1}: ")
         if not password:
             print("Error: Key cannot be empty")
             return None
-        
+
         salt = generate_salt()
-        key = derive_key_argon2(password.encode('utf-8'), salt)
+        key = derive_key_argon2_v2(password.encode('utf-8'), salt)
         keys.append(key)
         key_types.append(KEY_TYPE_PASSWORD_ARGON2)
         salts.append(salt)
-        key_data_list.append({
-            'index': i,
-            'password': password,
-            'salt': salt.hex()
-        })
-    
+
     return {
         'keys': keys,
         'key_types': key_types,
         'salts': salts,
-        'key_data_list': key_data_list
     }
 
-def save_keys_prompt(key_data_list: list):
+def build_v2_header(key_types: list[int], salts: list[bytes], filename: bytes, extension: bytes) -> bytes:
+    """Build the authenticated V2 header recording the KDF params used for new encryptions."""
+    key_params = [
+        {
+            'key_type': kt,
+            'time_cost': ARGON2_TIME_COST_V2,
+            'memory_cost': ARGON2_MEMORY_COST_V2,
+            'parallelism': ARGON2_PARALLELISM_V2,
+            'salt': salt,
+        }
+        for kt, salt in zip(key_types, salts)
+    ]
+    return pack_header_v2(key_params, filename, extension)
+
+def derive_keys_from_v2_header(passwords: list[str], header: dict) -> list[bytes]:
+    """Re-derive keys using the per-key params stored in a V2 header."""
+    keys = []
+    for password, kp in zip(passwords, header['keys']):
+        keys.append(derive_key_argon2_with_params(
+            password.encode('utf-8'), kp['salt'],
+            kp['time_cost'], kp['memory_cost'], kp['parallelism'],
+        ))
+    return keys
+
+def build_keyfile_entries(keys: list[bytes], salts: list[bytes]) -> list[dict]:
+    """V2 key files store the derived keys, never the raw passwords (no cross-service password leak)."""
+    return [{'index': i, 'key': keys[i].hex(), 'salt': salts[i].hex()} for i in range(len(keys))]
+
+def save_keys_prompt(keys: list, salts: list):
     """Prompt user to save keys and handle the saving process"""
+    key_data_list = build_keyfile_entries(keys, salts)
     print("\n" + "="*60)
     print("⚠ WARNING: Saving keys without encryption is risky!")
     print("If someone steals your key file, they can access your encrypted files.")
     print("="*60)
-    
+
     save_option = input("\nDo you want to save these keys to your device? (y/n): ").strip().lower()
     
     if save_option == 'y':
@@ -196,59 +221,70 @@ def collect_keys(num_keys: int):
     keys = []
     key_types = []
     salts = []
-    key_data_list = []
-    
+
     print("\nEnter your encryption keys:")
     for i in range(num_keys):
         password = getpass.getpass(f"Enter key {i + 1}: ")
         if not password:
             print("Error: Key cannot be empty")
             return None
-        
+
         salt = generate_salt()
-        key = derive_key_argon2(password.encode('utf-8'), salt)
+        key = derive_key_argon2_v2(password.encode('utf-8'), salt)
         keys.append(key)
         key_types.append(KEY_TYPE_PASSWORD_ARGON2)
         salts.append(salt)
-        key_data_list.append({
-            'index': i,
-            'password': password,
-            'salt': salt.hex()
-        })
-    
-    save_result = save_keys_prompt(key_data_list)
+
+    save_result = save_keys_prompt(keys, salts)
     if save_result is None:
         return None
-    
+
     return {
         'keys': keys,
         'key_types': key_types,
         'salts': salts,
-        'key_data_list': key_data_list
     }
 
-def collect_passwords_for_decrypt(num_keys: int):
-    """Collect passwords once (from key file or manual input) for directory decryption"""
+def _interpret_key_file(all_keys_data: list, num_keys: int):
+    """Turn a loaded key file into a material dict. V2 files carry derived keys; older files carry passwords."""
+    if len(all_keys_data) != num_keys:
+        print(f"Error: Key file contains {len(all_keys_data)} keys, but files require {num_keys} keys")
+        return None
+    if all('key' in entry for entry in all_keys_data):
+        keys = []
+        for entry in all_keys_data:
+            key_bytes = bytes.fromhex(entry['key'])
+            if len(key_bytes) != 32:
+                print("Error: Invalid key in key file")
+                return None
+            keys.append(key_bytes)
+        print(f"✓ All {num_keys} keys loaded from key file")
+        return {'mode': 'keys', 'keys': keys}
+    passwords = [entry['password'] for entry in all_keys_data]
+    print(f"✓ All {num_keys} passwords loaded from key file")
+    return {'mode': 'passwords', 'passwords': passwords}
+
+def collect_key_material_for_decrypt(num_keys: int):
+    """Collect key material once: ready keys from a V2 key file, or passwords (legacy file / manual entry)."""
     print(f"\nFiles encrypted with {num_keys} keys")
     load_option = input("Do you have a key file saved? (y/n): ").strip().lower()
-    
+
     if load_option == 'y':
         print("\nWhat format is your key file?")
         print("1. JSON file")
         print("2. Image (with hidden keys)")
-        
+
         format_choice = input("Select format (1-2): ").strip()
-        
+
         if format_choice not in ['1', '2']:
             print("Error: Invalid format choice")
             return None
-        
+
         if format_choice == '1':
             key_file = input("Enter path to key file: ").strip().strip('"')
             if not os.path.exists(key_file):
                 print(f"Error: Key file not found: {key_file}")
                 return None
-            
             if os.path.isdir(key_file):
                 print(f"Error: Path is a directory, not a file: {key_file}")
                 return None
@@ -257,27 +293,16 @@ def collect_passwords_for_decrypt(num_keys: int):
             if not os.path.exists(key_file):
                 print(f"Error: Image file not found: {key_file}")
                 return None
-        
+
         key_file_password = getpass.getpass("Enter password for the key file: ")
         try:
             if format_choice == '1':
                 all_keys_data = load_keys_file_json(key_file, key_file_password)
             else:
                 all_keys_data = load_keys_file_image(key_file, key_file_password)
-            
-            if len(all_keys_data) != num_keys:
-                print(f"Error: Key file contains {len(all_keys_data)} keys, but files require {num_keys} keys")
-                return None
-            
-            passwords = []
-            for i in range(num_keys):
-                key_data = all_keys_data[i]
-                passwords.append(key_data['password'])
-            
-            print(f"✓ All {num_keys} passwords loaded from key file")
-            return passwords
-        except Exception as e:
-            print(f"Error loading keys: {str(e)}")
+            return _interpret_key_file(all_keys_data, num_keys)
+        except Exception:
+            print("Error loading keys: wrong password or corrupted key file.")
             return None
     else:
         print("\nEnter your encryption passwords:")
@@ -288,8 +313,7 @@ def collect_passwords_for_decrypt(num_keys: int):
                 print("Error: Password cannot be empty")
                 return None
             passwords.append(password)
-        
-        return passwords
+        return {'mode': 'passwords', 'passwords': passwords}
 
 def derive_keys_from_passwords(passwords: list[str], salts: list[bytes]) -> list[bytes]:
     """Derive encryption keys from passwords and salts"""
@@ -298,75 +322,6 @@ def derive_keys_from_passwords(passwords: list[str], salts: list[bytes]) -> list
         key = derive_key_argon2(password.encode('utf-8'), salts[i])
         keys.append(key)
     return keys
-
-def collect_keys_for_decrypt(num_keys: int, key_types: list[int], salts: list[bytes]):
-    keys = []
-    
-    print(f"\nFile encrypted with {num_keys} keys")
-    load_option = input("Do you have a key file saved? (y/n): ").strip().lower()
-    
-    if load_option == 'y':
-        print("\nWhat format is your key file?")
-        print("1. JSON file")
-        print("2. Image (with hidden keys)")
-        
-        format_choice = input("Select format (1-2): ").strip()
-        
-        if format_choice not in ['1', '2']:
-            print("Error: Invalid format choice")
-            return None
-        
-        if format_choice == '1':
-            key_file = input("Enter path to key file: ").strip().strip('"')
-            if not os.path.exists(key_file):
-                print(f"Error: Key file not found: {key_file}")
-                return None
-            
-            if os.path.isdir(key_file):
-                print(f"Error: Path is a directory, not a file: {key_file}")
-                return None
-        else:
-            key_file = input("Enter path to image with hidden keys: ").strip().strip('"')
-            if not os.path.exists(key_file):
-                print(f"Error: Image file not found: {key_file}")
-                return None
-        
-        key_file_password = getpass.getpass("Enter password for the key file: ")
-        try:
-            if format_choice == '1':
-                all_keys_data = load_keys_file_json(key_file, key_file_password)
-            else:
-                all_keys_data = load_keys_file_image(key_file, key_file_password)
-            
-            if len(all_keys_data) != num_keys:
-                print(f"Error: Key file contains {len(all_keys_data)} keys, but file requires {num_keys} keys")
-                return None
-            
-            for i in range(num_keys):
-                key_data = all_keys_data[i]
-                password = key_data['password']
-                salt = bytes.fromhex(key_data['salt'])
-                key = derive_key_argon2(password.encode('utf-8'), salt)
-                keys.append(key)
-            
-            print(f"✓ All {num_keys} keys loaded from file")
-            return keys
-        except Exception as e:
-            print(f"Error loading keys: {str(e)}")
-            return None
-    else:
-        print("\nEnter your encryption keys:")
-        for i in range(num_keys):
-            password = getpass.getpass(f"Enter key {i + 1}: ")
-            if not password:
-                print("Error: Key cannot be empty")
-                return None
-            
-            salt = salts[i]
-            key = derive_key_argon2(password.encode('utf-8'), salt)
-            keys.append(key)
-        
-        return keys
 
 def encrypt_file():
     print("\n=== Quantum-Safe Multi-Layer Encryption ===\n")
@@ -396,16 +351,16 @@ def encrypt_file():
         
         with tqdm(desc="Generating encryption salts", leave=False) as pbar:
             pbar.update(1)
-        
-        encrypted_data = multi_layer_encrypt(file_path, key_data['keys'])
-        
+
         original_filename = filename.encode('utf-8')
         file_extension = ext.encode('utf-8')
-        
+
         with tqdm(desc="Preparing metadata", leave=False) as pbar:
-            metadata = pack_metadata(key_data['key_types'], key_data['salts'], original_filename, file_extension)
-            full_payload = metadata + encrypted_data
+            header = build_v2_header(key_data['key_types'], key_data['salts'], original_filename, file_extension)
             pbar.update(1)
+
+        encrypted_data = multi_layer_encrypt(file_path, key_data['keys'], aad=header)
+        full_payload = header + encrypted_data
         
         with tqdm(total=len(full_payload), unit='B', unit_scale=True, unit_divisor=1024, desc="Saving encrypted file") as pbar:
             with open(output_file, 'wb') as f:
@@ -420,39 +375,53 @@ def encrypt_file():
     except Exception as e:
         print(f"Error during encryption: {str(e)}")
 
+def decrypt_payload_to_memory(full_payload: bytes):
+    """Decrypt a multi-layer payload (V2 or legacy) in memory.
+
+    Returns (data, filename_bytes, ext_bytes), None if the user backed out, or raises on bad input/keys.
+    """
+    if is_v2(full_payload):
+        header, header_size = unpack_header_v2(full_payload)
+        material = collect_key_material_for_decrypt(len(header['keys']))
+        if material is None:
+            return None
+        keys = material['keys'] if material['mode'] == 'keys' else derive_keys_from_v2_header(material['passwords'], header)
+        data = multi_layer_decrypt(full_payload[header_size:], keys, aad=full_payload[:header_size])
+        return data, header['filename'], header['extension']
+    metadata_size = get_metadata_size(full_payload)
+    key_types, salts, original_filename, file_extension = unpack_metadata(full_payload[:metadata_size])
+    material = collect_key_material_for_decrypt(len(key_types))
+    if material is None:
+        return None
+    keys = material['keys'] if material['mode'] == 'keys' else derive_keys_from_passwords(material['passwords'], salts)
+    data = multi_layer_decrypt(full_payload[metadata_size:], keys)
+    return data, original_filename, file_extension
+
 def decrypt_file():
     print("\n=== Decrypt Quantum-Safe Multi-Layer Encrypted File ===\n")
-    
+    print("⚠ This writes an UNPROTECTED copy to disk. To just view a file, use 'Open file securely' instead.\n")
+
     encrypted_file = input("Enter path to encrypted file: ").strip().strip('"')
     if not os.path.exists(encrypted_file):
         print(f"Error: Encrypted file not found: {encrypted_file}")
         return
-    
+
     output_dir = get_output_directory()
-    
+
     print("\nDecrypting file...")
-    
+
     try:
         file_size = os.path.getsize(encrypted_file)
         with tqdm(total=file_size, unit='B', unit_scale=True, unit_divisor=1024, desc="Reading encrypted file") as pbar:
             with open(encrypted_file, 'rb') as f:
                 full_payload = f.read()
                 pbar.update(file_size)
-        
-        with tqdm(desc="Extracting metadata", leave=False) as pbar:
-            metadata_size = get_metadata_size(full_payload)
-            metadata = full_payload[:metadata_size]
-            encrypted_data = full_payload[metadata_size:]
-            pbar.update(1)
-        
-        key_types, salts, original_filename, file_extension = unpack_metadata(metadata)
-        num_keys = len(key_types)
-        
-        keys = collect_keys_for_decrypt(num_keys, key_types, salts)
-        if keys is None:
+
+        result = decrypt_payload_to_memory(full_payload)
+        if result is None:
             return
-        
-        decrypted_data = multi_layer_decrypt(encrypted_data, keys)
+        decrypted_data, original_filename, file_extension = result
+
         output_filename = _sanitize_steal_locker_output_filename(original_filename, file_extension)
         output_path = os.path.join(output_dir, output_filename)
         
@@ -495,25 +464,27 @@ def decrypt_directory():
     # Read first file to get encryption parameters (should be same for all)
     first_file_path = os.path.join(dir_path, files[0])
     try:
-        file_size = os.path.getsize(first_file_path)
         with open(first_file_path, 'rb') as f:
             full_payload = f.read()
-        
-        metadata_size = get_metadata_size(full_payload)
-        metadata = full_payload[:metadata_size]
-        key_types, _, _, _ = unpack_metadata(metadata)
-        num_keys = len(key_types)
-        
+
+        if is_v2(full_payload):
+            header, _ = unpack_header_v2(full_payload)
+            num_keys = len(header['keys'])
+        else:
+            metadata_size = get_metadata_size(full_payload)
+            key_types, _, _, _ = unpack_metadata(full_payload[:metadata_size])
+            num_keys = len(key_types)
+
         print(f"\n✓ Detected encryption parameters: {num_keys} keys")
-        
+
     except Exception as e:
         print(f"Error reading first file to detect encryption parameters: {str(e)}")
         print("Make sure the directory contains valid encrypted files.")
         return
     
-    # Collect passwords once (same passwords for all files)
-    passwords = collect_passwords_for_decrypt(num_keys)
-    if passwords is None:
+    # Collect key material once (same for all files): ready keys, or passwords to re-derive per file.
+    material = collect_key_material_for_decrypt(num_keys)
+    if material is None:
         return
     
     output_dir = get_output_directory()
@@ -537,15 +508,17 @@ def decrypt_directory():
                     full_payload = f.read()
                     pbar.update(file_size)
             
-            with tqdm(desc="  Extracting metadata", leave=False) as pbar:
+            if is_v2(full_payload):
+                header, header_size = unpack_header_v2(full_payload)
+                keys = material['keys'] if material['mode'] == 'keys' else derive_keys_from_v2_header(material['passwords'], header)
+                decrypted_data = multi_layer_decrypt(full_payload[header_size:], keys, aad=full_payload[:header_size])
+                original_filename, file_extension = header['filename'], header['extension']
+            else:
                 metadata_size = get_metadata_size(full_payload)
-                metadata = full_payload[:metadata_size]
-                encrypted_data = full_payload[metadata_size:]
-                pbar.update(1)
-            
-            key_types, salts, original_filename, file_extension = unpack_metadata(metadata)
-            keys = derive_keys_from_passwords(passwords, salts)
-            decrypted_data = multi_layer_decrypt(encrypted_data, keys)
+                key_types, salts, original_filename, file_extension = unpack_metadata(full_payload[:metadata_size])
+                keys = material['keys'] if material['mode'] == 'keys' else derive_keys_from_passwords(material['passwords'], salts)
+                decrypted_data = multi_layer_decrypt(full_payload[metadata_size:], keys)
+
             output_filename = _sanitize_steal_locker_output_filename(original_filename, file_extension)
             output_path = os.path.join(output_dir, output_filename)
             
@@ -621,14 +594,13 @@ def encrypt_directory():
             print(f"  File size: {file_size / (1024*1024):.2f} MB")
             print(f"  Using {num_keys} encryption layers")
             
-            encrypted_data = multi_layer_encrypt(file_path, key_data['keys'])
-            
             name, ext = get_file_info(file_path)
             original_filename = name.encode('utf-8')
             file_extension = ext.encode('utf-8')
-            
-            metadata = pack_metadata(key_data['key_types'], key_data['salts'], original_filename, file_extension)
-            full_payload = metadata + encrypted_data
+
+            header = build_v2_header(key_data['key_types'], key_data['salts'], original_filename, file_extension)
+            encrypted_data = multi_layer_encrypt(file_path, key_data['keys'], aad=header)
+            full_payload = header + encrypted_data
             
             output_file = os.path.join(output_dir, filename)
             
@@ -655,7 +627,7 @@ def encrypt_directory():
         print(f"⚠ IMPORTANT: Remember your keys to decrypt!")
         
         # Ask if user wants to save keys (one key file for all)
-        save_result = save_keys_prompt(key_data['key_data_list'])
+        save_result = save_keys_prompt(key_data['keys'], key_data['salts'])
         if save_result is None:
             print("\n⚠ Keys were not saved. Make sure to remember them!")
 
@@ -696,6 +668,25 @@ def encrypt_file_steal_locker():
     print(f"\n✓ Encrypted to {out_path}")
 
 
+def decrypt_steal_locker_payload_to_memory(payload: bytes, key_dir: Path):
+    """Decrypt an SL01 payload in memory; returns (data, filename_bytes, ext_bytes). Raises on any failure."""
+    meta_size = get_steal_locker_metadata_size(payload)
+    metadata = payload[:meta_size]
+    rest = payload[meta_size:]
+    wlen, fn_bytes, ext_bytes = unpack_steal_locker_metadata(metadata)
+    if len(rest) < wlen + 12:
+        raise ValueError("invalid payload")
+    wrapped = rest[:wlen]
+    if len(wrapped) != WRAPPED_BLOB_SIZE:
+        raise ValueError("invalid payload")
+    priv = load_private_key(ensure_keypair(key_dir)[0])
+    sym_key = unwrap_symmetric_key(wrapped, priv)
+    nonce = rest[wlen : wlen + 12]
+    ct = rest[wlen + 12 :]
+    aes = AESGCM(sym_key)
+    return aes.decrypt(nonce, ct, None), fn_bytes, ext_bytes
+
+
 def decrypt_file_steal_locker():
     """Decrypt a Steal Locker file; one generic error to avoid oracle leakage."""
     print("\n=== Steal Locker: Decrypt file ===\n")
@@ -705,32 +696,17 @@ def decrypt_file_steal_locker():
         return
     output_dir = get_output_directory()
     key_dir = _steal_locker_key_dir()
-    err_msg = "Decryption failed (wrong key, tampered data, or invalid file)"
     try:
         with open(enc_path, "rb") as f:
             payload = f.read()
-        meta_size = get_steal_locker_metadata_size(payload)
-        metadata = payload[:meta_size]
-        rest = payload[meta_size:]
-        wlen, fn_bytes, ext_bytes = unpack_steal_locker_metadata(metadata)
-        if len(rest) < wlen + 12:
-            raise ValueError(err_msg)
-        wrapped = rest[:wlen]
-        if len(wrapped) != WRAPPED_BLOB_SIZE:
-            raise ValueError(err_msg)
-        priv = load_private_key(ensure_keypair(key_dir)[0])
-        sym_key = unwrap_symmetric_key(wrapped, priv)
-        nonce = rest[wlen : wlen + 12]
-        ct = rest[wlen + 12 :]
-        aes = AESGCM(sym_key)
-        plaintext = aes.decrypt(nonce, ct, None)
+        plaintext, fn_bytes, ext_bytes = decrypt_steal_locker_payload_to_memory(payload, key_dir)
         out_name = _sanitize_steal_locker_output_filename(fn_bytes, ext_bytes)
         out_path = os.path.join(output_dir, out_name)
         with open(out_path, "wb") as f:
             f.write(plaintext)
         print(f"\n✓ Decrypted to {out_path}")
     except Exception:
-        print(err_msg)
+        print("Decryption failed (wrong key, tampered data, or invalid file)")
 
 
 def steal_locker_lock_folder():
@@ -815,22 +791,65 @@ def steal_locker_menu():
             print("Invalid option.")
 
 
+def open_file_securely():
+    """Decrypt to a temp file for viewing only: optional device verification, then auto-wipe."""
+    print("\n=== Open File Securely (temp view, auto-wipe) ===\n")
+    enc_path = input("Enter path to encrypted file: ").strip().strip('"')
+    if not os.path.exists(enc_path):
+        print(f"Error: File not found: {enc_path}")
+        return
+
+    print("\nHow should the file be protected before opening?")
+    print("1. Verify my identity with this device (Hello / Touch ID / account password)")
+    print("2. Keys only (skip device verification)")
+    protect_choice = input("Select (1-2, Enter = 1): ").strip()
+    if protect_choice != '2':
+        if not verify_device_identity():
+            print("Verification failed. File stays locked.")
+            return
+
+    print("\nHow do you want to open it?")
+    print("1. Open with the default app, wipe when I'm done")
+    print("2. Extract to a temp folder (I'll open it myself), wipe when I'm done")
+    open_choice = input("Select (1-2, Enter = 1): ").strip()
+    launch = open_choice != '2'
+
+    try:
+        with open(enc_path, 'rb') as f:
+            full_payload = f.read()
+
+        if full_payload[:4] == SL01_MAGIC:
+            # Steal Locker file: the device key itself is the gate.
+            data, fn_bytes, ext_bytes = decrypt_steal_locker_payload_to_memory(full_payload, _steal_locker_key_dir())
+        else:
+            result = decrypt_payload_to_memory(full_payload)
+            if result is None:
+                return
+            data, fn_bytes, ext_bytes = result
+
+        filename = _sanitize_steal_locker_output_filename(fn_bytes, ext_bytes)
+        view_file_temp(data, filename, launch=launch)
+    except Exception:
+        print("Decryption failed (wrong key, tampered data, or invalid file).")
+
+
 def main():
     print("=" * 60)
     print("  Quantum-Safe Multi-Layer Encryption")
     print("=" * 60)
-    
+
     while True:
         print("\nOptions:")
         print("1. Encrypt a file")
         print("2. Decrypt a file")
         print("3. Encrypt all files in a directory")
         print("4. Decrypt all files in a directory")
-        print("5. Steal Locker (device keys, no third-party recovery)")
-        print("6. Exit")
-        
-        choice = input("\nSelect an option (1-6): ").strip()
-        
+        print("5. Open file securely (temp view, auto-wipe)")
+        print("6. Steal Locker (device keys, no third-party recovery)")
+        print("7. Exit")
+
+        choice = input("\nSelect an option (1-7): ").strip()
+
         if choice == '1':
             encrypt_file()
         elif choice == '2':
@@ -840,12 +859,14 @@ def main():
         elif choice == '4':
             decrypt_directory()
         elif choice == '5':
-            steal_locker_menu()
+            open_file_securely()
         elif choice == '6':
+            steal_locker_menu()
+        elif choice == '7':
             print("\nGoodbye!")
             sys.exit(0)
         else:
-            print("Invalid option. Please select 1-6.")
+            print("Invalid option. Please select 1-7.")
 
 if __name__ == "__main__":
     main()

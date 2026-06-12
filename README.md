@@ -127,9 +127,34 @@ When you save your keys, they're stored in an encrypted format. This means:
 - Even if someone steals the key file, they can't use it without your password
 - You only need to remember one password (for the key file) instead of remembering all your encryption keys
 
+New key files store the **derived keys**, not your typed passwords, so even if the key-file password is ever broken, your original passwords (which you may reuse elsewhere) are not exposed. The key file is itself versioned and records its own KDF parameters, so its protection can be strengthened over time. Key files saved by older versions still load.
+
 If you choose to save keys in an image, the image will look completely normal. The keys are hidden using steganography, which embeds the data in a way that's invisible to the naked eye. You can share the image, use it as a wallpaper, or store it anywhere, and it will still look like a regular picture.
 
 When you save keys to an image, the output will always be saved as a PNG file, even if your original cover image was a different format. This is necessary because PNG is a lossless format that preserves the hidden steganography data. Other formats like JPEG use compression that would destroy the hidden information. The program will automatically convert your cover image to PNG format during the process, so you can use any image you want as a starting point.
+
+## Opening Files Securely (temp view, auto-wipe)
+
+Normal decryption writes a permanent, unprotected copy of your file to disk. If you just want to *look* at a file, use main-menu option `5. Open file securely` instead. It works on Windows, macOS, and Linux.
+
+You choose two things each time:
+
+**1. Protection before opening:**
+- **Verify my identity with this device** — the tool asks your OS to confirm it's really you, using the best method available:
+  - Windows: Windows Hello (device PIN / fingerprint / face) — requires `pip install winsdk`
+  - macOS: Touch ID or device password — requires `pip install pyobjc-framework-LocalAuthentication`
+  - Linux: account password via polkit (`pkexec`), no extra package
+  - Any OS fallback: your Steal Locker device-key passphrase
+  - Your OS account password is never seen or stored by this tool; the OS only reports verified yes/no.
+- **Keys only** — skip device verification; your encryption keys are still required as always.
+
+**2. How to open:**
+- **Open with the default app** — the file appears in its normal viewer (photos, PDFs, documents).
+- **Extract to a temp folder** — you get the temp path and open it yourself.
+
+Either way, the decrypted copy lives only in a private temp folder (owner-only permissions), and when you press Enter to finish, it is **overwritten with random data and deleted**. If an app still holds the file open, the tool retries until it can wipe, or tells you exactly what to delete manually.
+
+Honest limits: while the file is open, a plaintext copy exists in temp — the viewing app could cache or copy it, and on SSDs overwriting is best-effort. For data that should never touch disk unprotected, this is still far safer than a permanent decrypt, but it is not magic. True device-bound storage is what Steal Locker (below) is for.
 
 ## Steal Locker (device-locked encryption)
 
@@ -208,3 +233,13 @@ If you're having trouble loading keys from an image, make sure you're using the 
 The tool uses AES-256-GCM and ChaCha20-Poly1305 encryption algorithms, which are considered quantum-resistant for symmetric encryption. Keys are derived using Argon2, a memory-hard function that makes brute-force attacks extremely difficult. The alternating use of different encryption algorithms provides additional security layers.
 
 Keys are derived from your passwords using Argon2, which is designed to be resistant to both traditional and quantum computing attacks. Each key gets its own randomly generated salt, ensuring that even identical passwords produce different encryption keys.
+
+### File format (V2) and backward compatibility
+
+New files are written in a self-describing **V2** format (magic `SLV2`):
+
+- The file header records the KDF parameters (Argon2 time/memory/parallelism) used for each key, so the program can **strengthen Argon2 over time without breaking files you already encrypted**.
+- The entire header is bound to the ciphertext as authenticated associated data (AEAD AAD), so any tampering with the header — salts, filename, or KDF params — is detected and decryption fails cleanly.
+- KDF parameters read from a file are bounds-checked, so a crafted file cannot force an out-of-memory condition before any key is checked.
+
+**Old files still decrypt.** Files encrypted before V2 have no magic header and are detected and decrypted on the original code path with the original (legacy) Argon2 parameters. You do not need to re-encrypt anything.
